@@ -98,14 +98,20 @@ pub fn run(
 ) -> Result<()> {
     close_dangling_calls(&mut history);
     let specs = tools.specs();
+    // When a busy model hands over to a free fallback, the rest of the turn stays with the one that
+    // answered instead of waiting on the busy one again at every step.
+    let mut model = cfg.model.clone();
     for _ in 0..MAX_STEPS {
-        let req = Request { model: &cfg.model, system: &cfg.system, messages: &history, tools: &specs, effort: &cfg.effort };
+        let req = Request { model: &model, system: &cfg.system, messages: &history, tools: &specs, effort: &cfg.effort };
         let reply = send(&cfg.provider, &cfg.key, &req, cancel, &mut |e| match e {
             StreamEvent::Text(t) => emit(RunEvent::Text(t)),
             StreamEvent::Thinking(t) => emit(RunEvent::Thinking(t)),
             StreamEvent::Retrying { model } => emit(RunEvent::Retrying { model }),
         })?;
         emit(RunEvent::Usage { usage: reply.usage, cost: cfg.price.map(|p| cost(p, reply.usage.input, reply.usage.output)) });
+        if let Some(m) = reply.message.model.as_deref().filter(|m| !m.is_empty() && *m != model) {
+            model = m.to_string();
+        }
         let calls = reply.message.tool_calls();
         history.push(reply.message.clone());
         emit(RunEvent::Assistant(reply.message));

@@ -66,6 +66,31 @@ fn main() {
                 step(&mut harness);
                 std::thread::sleep(std::time::Duration::from_millis(16));
             }
+        } else if let Some(n) = l.get("timeFrames").and_then(|v| v.as_u64()) {
+            // How long frames take now (a lagging window shows here), with a pointer moving over the page.
+            let mut worst = 0u128;
+            let start = std::time::Instant::now();
+            for i in 0..n {
+                let pos = egui::pos2(500.0 + (i % 40) as f32 * 5.0, 400.0);
+                harness.input_mut().events.push(egui::Event::PointerMoved(pos));
+                let t = std::time::Instant::now();
+                step(&mut harness);
+                worst = worst.max(t.elapsed().as_millis());
+            }
+            println!("frames: {n} in {} ms, worst {worst} ms", start.elapsed().as_millis());
+        } else if let Some(ms) = l.get("waitAgent").and_then(|v| v.as_u64()) {
+            // Run frames until the AI Agent's turn ends (at most `ms`), then print its chat.
+            let start = std::time::Instant::now();
+            let end = start + std::time::Duration::from_millis(ms);
+            step_n(&mut harness, 4);
+            while harness.state().agent_running() && std::time::Instant::now() < end {
+                step(&mut harness);
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+            println!("agent: {} ms", start.elapsed().as_millis());
+            if let Some(p) = l.get("transcript").and_then(|v| v.as_str()) {
+                std::fs::write(p, harness.state().agent_transcript().to_string()).expect("write transcript");
+            }
         } else if let Some(m) = l.get("method").and_then(|v| v.as_str()) {
             let (req, reply) = ControlRequest::new(m, l.get("params").cloned().unwrap_or_default());
             tx.send(req).expect("send");

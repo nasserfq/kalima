@@ -1606,6 +1606,26 @@ fn paste_special_html_and_rtf_keep_bold() {
     assert!(s.run("edit.pasteSpecial", &json!({"as": "text", "text": huge})).is_err());
 }
 
+/// Pasting a titled passage into an empty right-to-left line (the AI Agent writing a new Arabic
+/// document) keeps the title a heading, with the line's direction; pasting into text keeps the
+/// paragraph that was there.
+#[test]
+fn pasting_paragraphs_into_an_empty_line_keeps_their_heading() {
+    let mut s = s();
+    run(&mut s, "para.rtl", json!({"value": true}));
+    run(&mut s, "edit.pasteSpecial", json!({"as": "html", "html": "<h1 style=\"text-align:center\">عنوان</h1><p>نص</p>"}));
+    let first = s.doc.body.first().and_then(|b| b.as_para()).unwrap();
+    assert_eq!(first.props.style.as_deref(), Some("Heading1"));
+    assert_eq!(first.props.bidi, Some(true), "the line's direction stays");
+    // Into a paragraph with text, that paragraph keeps its own formatting.
+    run(&mut s, "document.setText", json!({"text": "x"}));
+    run(&mut s, "para.alignCenter", json!({}));
+    run(&mut s, "caret.docEnd", json!({}));
+    run(&mut s, "edit.pasteSpecial", json!({"as": "html", "html": "<h1>T</h1><p>b</p>"}));
+    let first = s.doc.body.first().and_then(|b| b.as_para()).unwrap();
+    assert_eq!(first.props.style, None, "the paragraph with text keeps its own formatting");
+}
+
 #[test]
 fn paste_special_respects_track_changes_and_brings_lists() {
     let mut s = s();

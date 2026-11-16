@@ -67,6 +67,24 @@ pub(crate) fn ask(app: &mut WordApp, ctx: &egui::Context, text: &str) -> Result<
     }
 }
 
+impl WordApp {
+    /// Whether the AI Agent is working on a turn now (for scripted tests).
+    pub fn agent_running(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.agent.state.as_ref().is_some_and(native::State::running);
+        #[cfg(target_arch = "wasm32")]
+        return false;
+    }
+
+    /// The AI Agent's chat so far and its last error, as JSON (for scripted tests).
+    pub fn agent_transcript(&self) -> serde_json::Value {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.agent.state.as_ref().map(native::State::transcript).unwrap_or_default();
+        #[cfg(target_arch = "wasm32")]
+        return serde_json::Value::Null;
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use std::collections::HashMap;
@@ -167,6 +185,14 @@ mod native {
                 notice: None,
                 cost: 0.0,
             }
+        }
+
+        pub(super) fn running(&self) -> bool {
+            self.run.is_some()
+        }
+
+        pub(super) fn transcript(&self) -> Value {
+            json!({"chat": self.chat, "notice": self.notice})
         }
 
         fn provider(&self) -> Option<Provider> {
@@ -306,7 +332,7 @@ mod native {
         if let Some(error) = done
             && let Some(run) = st.run.take()
         {
-            st.notice = error;
+            st.notice = error.as_deref().map(friendly);
             // The whole turn is one Undo step, while its document is still the active one.
             if app.session.document_id() == run.doc {
                 app.session.squash_undo_since(run.mark, super::title());
@@ -319,7 +345,7 @@ mod native {
         let has = |s: &str| e.contains(s);
         if has(" 401") || has(" 403") || has("API key not valid") || has("invalid x-api-key") {
             l("المفتاح غير صحيح. افتح «الخدمة» وأدخل مفتاحًا جديدًا.", "The key isn't valid. Open Service and enter a new key.").to_string()
-        } else if has("returned 5") || has("high demand") || has("overloaded") {
+        } else if has("returned 5") || has("high demand") || has("overloaded") || has("Internal error") {
             l(
                 "الخدمة مزدحمة الآن ولم تستجب بعد عدة محاولات. حاول بعد دقيقة، أو اختر نموذجًا آخر من القائمة.",
                 "The service is busy right now and didn't answer after several tries. Try again in a minute, or choose another model.",
@@ -333,8 +359,8 @@ mod native {
             .to_string()
         } else if has(" 429") {
             l(
-                "تجاوزت حد الاستخدام لهذا النموذج الآن. انتظر قليلًا أو اختر نموذجًا آخر.",
-                "You've reached this model's usage limit for now. Wait a little or choose another model.",
+                "بلغتَ الحد المجاني لنماذج هذه الخدمة الآن (في Gemini نحو ٢٠ طلبًا في اليوم لكل نموذج، وكل مهمة تستهلك طلبين أو ثلاثة). يتجدد الحد غدًا، أو اختر خدمة أخرى من «الخدمة».",
+                "You've reached this service's free limit for now (Gemini gives about 20 requests a day per model, and each task takes two or three). It renews tomorrow, or choose another service under Service.",
             )
             .to_string()
         } else if has("network") {
@@ -355,29 +381,45 @@ mod native {
              \n\
              Quality comes first. Write like a gifted professional author and editor: rich, vivid, well-organised \
              prose with a clear beginning, middle and end, varied sentences and precise vocabulary. In Arabic, write \
-             eloquent Modern Standard Arabic with correct grammar and punctuation (، ؛ ؟). Never pad, never repeat \
-             yourself, and never leave placeholders. A story has a title, characters, a setting and an arc over \
-             several developed paragraphs; an article or report has a title, an introduction, headed sections and \
-             a conclusion.\n\
+             eloquent Modern Standard Arabic with correct grammar, hamzas and punctuation (، ؛ ؟ « »), without full \
+             diacritics (tashkeel) unless asked. Never pad and never repeat yourself. A story has a title, \
+             characters, a setting and an arc over several developed paragraphs; an article or report has a title, \
+             an introduction, headed sections and a conclusion; a letter has a date, the addressee, a greeting, a \
+             clear request, a courteous closing and a signature block. Use [square brackets] only for personal \
+             details the person must fill in (their name, an ID, a date), never for content you can write. Don't \
+             sign as وكيل or invent an author.\n\
              \n\
-             How to work:\n\
-             - To write new content or rewrite the document (a story, article, letter, report, plan, poem…), call \
-             write_document ONCE with the complete content as HTML: <h1> title, <h2> section headings, one <p> per \
-             paragraph, lists, <strong>/<em> for emphasis, <blockquote> for a quotation. Use mode \"replace\" when \
-             the document is empty or the person asked for something new, \"append\" to add to what is there. \
-             Never type long text piece by piece, and never write the same content twice.\n\
-             - Design tastefully with inline CSS in that HTML: centre the title (text-align:center) and give it one \
-             calm accent colour (such as #1F3A5F, #0F5132 or #7A3E00) that the section headings share; keep body \
-             text black and its size normal. Restraint looks professional: no rainbow colours, no huge fonts.\n\
-             - For small edits: get_text to read, select_text to select words, type_text to replace them, and \
-             execute or batch to run commands (list_commands finds command ids and params; for example \
-             format.bold, format.italic, format.size {{\"size\": 14}}, format.color {{\"color\": \"1F3A5F\"}}, \
-             para.alignCenter, styles.apply {{\"style\": \"Heading 1\"}}, insert.table {{\"rows\": 3, \"cols\": 3}}). \
-             Don't guess command ids: look them up.\n\
-             - Don't open, save, close or print files: the person does that.\n\
-             - Everything you do in one turn is a single Undo step for the person.\n\
-             - When you're done, reply in the person's language in one or two short sentences: what you made or \
-             changed. Don't paste the content into the chat.\n"
+             Writing new content (a story, article, report, letter, CV, plan, poem…): call write_document ONCE \
+             with the complete content as HTML. <h1> is the title, <h2>/<h3> are section headings, one <p> per \
+             paragraph, <ul>/<ol> for lists, <strong>/<em> for emphasis, <blockquote> for a quotation, <table> \
+             only for real tabular data (never for layout). Mode \"replace\" when the document is empty or the \
+             person asked for something new. Never type long text piece by piece, never write the same content \
+             twice.\n\
+             \n\
+             Design tastefully with inline CSS in that HTML: centre the title (text-align:center) and give it and \
+             the section headings one calm accent colour (such as #1F3A5F, #0F5132 or #7A3E00); a short subtitle \
+             under the title may be centred and grey. Justify body paragraphs (text-align:justify) and keep their \
+             text black and their size normal. In a table, make the header row <th> cells bold with a light \
+             background (such as #E8EEF6). Don't set font-family (the document's Arabic font is used), and don't use \
+             <div> wrappers, margins, widths or borders. Restraint looks professional: no rainbow colours, no huge \
+             fonts.\n\
+             \n\
+             Changing an existing document: read it first (get_text; inspect_document shows styles and formatting).\n\
+             - Correcting, improving, shortening or translating it: keep its structure. Rewrite the paragraphs as \
+             they are; don't add a title, headings or sections it didn't have. If the whole document changes, call \
+             write_document with mode \"replace\" and the same structure (its title as <h1> only if it already had \
+             one). If only the selection or one passage changes, select_text it and type_text the new wording.\n\
+             - Adding to it (a table, a summary, a conclusion, a section): write_document with mode \"append\" adds \
+             after the text; never rewrite what is already there to add something.\n\
+             - Formatting part of it (bold a heading, colour, size, alignment, style): select_text the exact words, \
+             then execute commands on the selection, for example format.bold {{\"value\": true}}, format.growFont, \
+             format.size {{\"size\": 20}}, format.color {{\"color\": \"1F3A5F\"}}, para.alignCenter, styles.apply \
+             {{\"style\": \"Heading 1\"}}. In batch, every entry is an engine command id (select.text \
+             {{\"text\": \"…\"}}, format.bold…), not a tool name. list_commands finds other commands: don't guess ids.\n\
+             \n\
+             Don't open, save, close or print files: the person does that. Everything you do in one turn is a single \
+             Undo step for the person. When you're done, reply in the person's language in one or two short \
+             sentences: what you made or changed. Don't paste the content into the chat.\n"
         );
         if selection.trim().is_empty() {
             s.push_str("Nothing is selected now.");
@@ -428,7 +470,8 @@ mod native {
             });
             let error = match r {
                 Ok(()) | Err(Error::Cancelled) => None,
-                Err(e) => Some(friendly(&e.to_string())),
+                // Worded in `drain`, on the window's thread, where the interface language is set.
+                Err(e) => Some(e.to_string()),
             };
             let _ = tx.send(Msg::Done(error));
             worker_ctx.request_repaint();
@@ -553,9 +596,52 @@ mod native {
             if has_arabic(&html) && !start.is_null() && !end.is_null() {
                 self.exec("select.range", json!({"anchor": start, "focus": end}))?;
                 self.exec("para.rtl", json!({"value": true}))?;
+                self.rtl_tables(&start, &end)?;
                 self.exec("select.range", json!({"anchor": end, "focus": end}))?;
             }
             Ok(if replace { "Wrote the document." } else { "Added the content after the existing text." }.into())
+        }
+    }
+
+    impl AppTools {
+        /// Make the tables written between `start` and `end` right to left, so their first column
+        /// stands at the right as in any Arabic table.
+        fn rtl_tables(&mut self, start: &Value, end: &Value) -> Result<(), String> {
+            let top = |p: &Value| p.get("path").and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_u64);
+            let (Some(from), Some(to)) = (top(start), top(end)) else { return Ok(()) };
+            let doc = self.exec("document.inspect", json!({}))?;
+            let tables: Vec<u64> = doc
+                .get("blocks")
+                .and_then(Value::as_array)
+                .map(|b| {
+                    b.iter()
+                        .filter(|b| b.get("type").and_then(Value::as_str) == Some("table"))
+                        .filter_map(|b| b.get("index").and_then(Value::as_u64))
+                        .filter(|i| (from..=to).contains(i))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for i in tables {
+                let mut at = start.clone();
+                if let Some(o) = at.as_object_mut() {
+                    o.insert("path".into(), json!([i, 0, 0, 0]));
+                    o.insert("off".into(), json!(0));
+                }
+                self.exec("select.range", json!({"anchor": at, "focus": at}))?;
+                self.exec("table.rtl", json!({"value": true}))?;
+            }
+            Ok(())
+        }
+    }
+
+    /// The command a tool name stands for, when a model sends a tool name as a command id.
+    fn command_for_tool(name: &str) -> Option<&'static str> {
+        match name {
+            "select_text" => Some("select.text"),
+            "type_text" => Some("text.insert"),
+            "get_text" => Some("document.text"),
+            "inspect_document" => Some("document.inspect"),
+            _ => None,
         }
     }
 
@@ -618,6 +704,18 @@ mod native {
                         o.insert("paragraphs".into(), Value::Bool(true));
                     }
                     o.insert("text".into(), Value::String(t));
+                }
+            }
+            // Models often put the tool names in a batch: run the commands they stand for.
+            if name == "batch"
+                && let Some(list) = input.get_mut("commands").and_then(Value::as_array_mut)
+            {
+                for c in list.iter_mut() {
+                    if let Some(id) = c.get("command").and_then(Value::as_str).and_then(command_for_tool)
+                        && let Some(o) = c.as_object_mut()
+                    {
+                        o.insert("command".into(), Value::String(id.into()));
+                    }
                 }
             }
             let commands: Vec<&str> = match name {

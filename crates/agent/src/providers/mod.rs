@@ -96,16 +96,27 @@ const RETRY_WAITS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(
 /// Whether `e` means the service is busy or briefly down (worth sending the same request again).
 /// Nothing has streamed yet when these come back, so sending again is safe.
 pub fn is_busy(e: &Error) -> bool {
-    matches!(e, Error::Api { status: 500 | 502 | 503 | 504 | 529, .. }) || matches!(e, Error::Api { status: 0, body, .. } if is_overload_text(body))
+    matches!(e, Error::Api { status: 500 | 502 | 503 | 504 | 529, .. })
+        || matches!(e, Error::Api { status: 0, body, .. } if is_overload_text(body))
+        // A model so busy it doesn't start answering in time.
+        || matches!(e, Error::Network(m) if m.to_lowercase().contains("timed out") || m.to_lowercase().contains("timeout"))
 }
 
 fn is_overload_text(body: &str) -> bool {
     let b = body.to_lowercase();
-    b.contains("overloaded") || b.contains("high demand") || b.contains("unavailable")
+    b.contains("overloaded") || b.contains("high demand") || b.contains("unavailable") || b.contains("internal error")
+}
+
+enum Busy {
+    Overloaded,
+    Slow,
 }
 
 /// Google's free models, best first: when one is busy, out of quota or gone, the next is tried.
-const GEMINI_FREE: [&str; 3] = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest"];
+/// (Checked with a free key on 2026-11-16: 2.5 Flash is gone for new keys, and the Pro models have
+/// no free quota.) A name that stops working is skipped at once.
+const GEMINI_FREE: [&str; 6] =
+    ["gemini-flash-latest", "gemini-3-flash-preview", "gemini-3.6-flash", "gemini-flash-lite-latest", "gemini-3.1-flash-lite", "gemma-4-31b-it"];
 
 /// Other models to try, in order, when `model` stays busy or is out of quota: the other free
 /// models of the same service. A paid or unknown model has none (the person chose it on purpose).
@@ -133,8 +144,13 @@ pub fn send(p: &Provider, key: &str, req: &Request, cancel: &Arc<AtomicBool>, on
         loop {
             match send_once(p, key, &r, cancel, on_event) {
                 Err(e) if is_busy(&e) => {
+                    let e_kind = if matches!(e, Error::Network(_)) { Busy::Slow } else { Busy::Overloaded };
                     if i == 0 {
                         last = Some(e);
+                    }
+                    // A model that didn't answer in time won't soon: try the next one at once.
+                    if matches!(e_kind, Busy::Slow) {
+                        break;
                     }
                     let Some(wait) = waits.get(attempt) else { break };
                     attempt = attempt.saturating_add(1);
@@ -215,7 +231,7 @@ pub fn cost(price: (f64, f64), input: u64, output: u64) -> f64 {
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
-        .timeout_recv_response(Some(Duration::from_secs(120)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
         .http_status_as_error(false)
         .user_agent(concat!("Kalima-Agent/", env!("CARGO_PKG_VERSION")))
         // The system's own certificate store, as the app's updater uses.
@@ -316,13 +332,17 @@ mod tests {
         assert!(!is_busy(&api(429)), "a quota limit doesn't clear in seconds");
         assert!(is_busy(&Error::Api { service: "Gemini".into(), status: 0, body: "The model is overloaded".into() }));
         assert!(!is_busy(&Error::Network("no route".into())));
+        assert!(is_busy(&Error::Network("timeout: timed out reading response".into())));
     }
 
     #[test]
     fn a_busy_gemini_flash_falls_back_to_other_free_models() {
         let g = builtin_providers().into_iter().find(|p| p.id == "gemini").unwrap();
-        assert_eq!(fallback_models(&g, "gemini-flash-latest"), ["gemini-2.5-flash", "gemini-flash-lite-latest"]);
-        assert_eq!(fallback_models(&g, "gemini-3.1-flash-lite"), GEMINI_FREE);
+        assert_eq!(
+            fallback_models(&g, "gemini-flash-latest"),
+            ["gemini-3-flash-preview", "gemini-3.6-flash", "gemini-flash-lite-latest", "gemini-3.1-flash-lite", "gemma-4-31b-it"]
+        );
+        assert_eq!(fallback_models(&g, "gemini-3.5-flash"), GEMINI_FREE);
         let c = builtin_providers().into_iter().find(|p| p.id == "anthropic").unwrap();
         assert!(fallback_models(&c, "claude-x").is_empty());
     }
@@ -359,10 +379,10 @@ mod tests {
         let mut events = Vec::new();
         let r = send(&p, "k", &req, &Arc::new(AtomicBool::new(false)), &mut |e| events.push(e)).unwrap();
         assert_eq!(r.message.text(), "ok");
-        assert_eq!(r.message.model.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(r.message.model.as_deref(), Some("gemini-3-flash-preview"));
         let retries: Vec<_> =
             events.iter().filter_map(|e| if let StreamEvent::Retrying { model } = e { Some(model.as_str()) } else { None }).collect();
-        assert_eq!(retries, ["gemini-flash-latest", "gemini-flash-latest", "gemini-2.5-flash"]);
+        assert_eq!(retries, ["gemini-flash-latest", "gemini-flash-latest", "gemini-3-flash-preview"]);
     }
 
     #[test]

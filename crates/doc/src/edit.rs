@@ -1064,11 +1064,19 @@ impl Document {
             Block::Para(p) => {
                 let l = self.para_mut(pos.story, &left)?;
                 let keep = l.props.clone();
+                // Pasting whole paragraphs into an empty one (a new line, or a document whose text
+                // was all selected) keeps the first pasted paragraph's own formatting, its heading
+                // style for one, as Word does; into text, the paragraph there keeps its own.
+                let was_empty = l.is_empty();
                 let mut p2 = p;
-                let pprops = p2.props.clone();
+                let mut pprops = p2.props.clone();
+                // A pasted paragraph that doesn't say which way it runs keeps the line's direction.
+                if pprops.bidi.is_none() {
+                    pprops.bidi = keep.bidi;
+                }
                 p2.section = None;
                 l.append(p2);
-                l.props = if keep.is_empty() { pprops } else { keep };
+                l.props = if keep.is_empty() || was_empty { pprops } else { keep };
             }
             t @ Block::Table(_) => {
                 self.insert_block(pos.story, &left.with_last(idx), t)?;
