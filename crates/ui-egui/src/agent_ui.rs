@@ -67,6 +67,24 @@ pub(crate) fn ask(app: &mut WordApp, ctx: &egui::Context, text: &str) -> Result<
     }
 }
 
+impl WordApp {
+    /// Whether the AI Agent is working on a turn now (for scripted tests).
+    pub fn agent_running(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.agent.state.as_ref().is_some_and(native::State::running);
+        #[cfg(target_arch = "wasm32")]
+        return false;
+    }
+
+    /// The AI Agent's chat so far and its last error, as JSON (for scripted tests).
+    pub fn agent_transcript(&self) -> serde_json::Value {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.agent.state.as_ref().map(native::State::transcript).unwrap_or_default();
+        #[cfg(target_arch = "wasm32")]
+        return serde_json::Value::Null;
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use std::collections::HashMap;
@@ -129,6 +147,12 @@ mod native {
         text: String,
         /// The tool running now: its call id.
         tool: Option<String>,
+        /// The model is thinking (its reasoning streams but isn't shown).
+        thinking: bool,
+        /// The service was busy and the request is being sent again, to this model.
+        retrying: Option<String>,
+        /// When the turn began, for the seconds shown while waiting.
+        started: std::time::Instant,
         /// Undo history position and document when the turn began.
         mark: u64,
         doc: u64,
@@ -161,6 +185,14 @@ mod native {
                 notice: None,
                 cost: 0.0,
             }
+        }
+
+        pub(super) fn running(&self) -> bool {
+            self.run.is_some()
+        }
+
+        pub(super) fn transcript(&self) -> Value {
+            json!({"chat": self.chat, "notice": self.notice})
         }
 
         fn provider(&self) -> Option<Provider> {
@@ -266,9 +298,22 @@ mod native {
         if let Some(run) = st.run.as_mut() {
             while let Ok(msg) = run.rx.try_recv() {
                 match msg {
-                    Msg::Event(RunEvent::Text(t)) => run.text.push_str(&t),
+                    Msg::Event(RunEvent::Text(t)) => {
+                        run.thinking = false;
+                        run.retrying = None;
+                        run.text.push_str(&t);
+                    }
+                    Msg::Event(RunEvent::Thinking(_)) => {
+                        run.thinking = true;
+                        run.retrying = None;
+                    }
+                    Msg::Event(RunEvent::Retrying { model }) => {
+                        run.thinking = false;
+                        run.retrying = Some(model);
+                    }
                     Msg::Event(RunEvent::Assistant(m)) => {
                         run.text.clear();
+                        run.thinking = false;
                         st.chat.push(m);
                     }
                     Msg::Event(RunEvent::ToolResults(m)) => st.chat.push(m),
@@ -279,7 +324,7 @@ mod native {
                     Msg::Event(RunEvent::Approve { reply, .. }) => {
                         let _ = reply.send(wordcraft_agent::run::Approval::No);
                     }
-                    Msg::Event(RunEvent::Thinking(_) | RunEvent::Finished(_)) => {}
+                    Msg::Event(RunEvent::Finished(_)) => {}
                     Msg::Done(e) => done = Some(e),
                 }
             }
@@ -287,7 +332,7 @@ mod native {
         if let Some(error) = done
             && let Some(run) = st.run.take()
         {
-            st.notice = error;
+            st.notice = error.as_deref().map(friendly);
             // The whole turn is one Undo step, while its document is still the active one.
             if app.session.document_id() == run.doc {
                 app.session.squash_undo_since(run.mark, super::title());
@@ -300,10 +345,22 @@ mod native {
         let has = |s: &str| e.contains(s);
         if has(" 401") || has(" 403") || has("API key not valid") || has("invalid x-api-key") {
             l("المفتاح غير صحيح. افتح «الخدمة» وأدخل مفتاحًا جديدًا.", "The key isn't valid. Open Service and enter a new key.").to_string()
+        } else if has("returned 5") || has("high demand") || has("overloaded") || has("Internal error") {
+            l(
+                "الخدمة مزدحمة الآن ولم تستجب بعد عدة محاولات. حاول بعد دقيقة، أو اختر نموذجًا آخر من القائمة.",
+                "The service is busy right now and didn't answer after several tries. Try again in a minute, or choose another model.",
+            )
+            .to_string()
+        } else if has("timed out") || has("timeout") {
+            l(
+                "تأخرت الخدمة في الرد. حاول مرة أخرى، أو اختر نموذجًا أسرع.",
+                "The service took too long to answer. Try again, or choose a faster model.",
+            )
+            .to_string()
         } else if has(" 429") {
             l(
-                "تجاوزت حد الاستخدام لهذا النموذج الآن. انتظر قليلًا أو اختر نموذجًا آخر.",
-                "You've reached this model's usage limit for now. Wait a little or choose another model.",
+                "بلغتَ الحد المجاني لنماذج هذه الخدمة الآن (في Gemini نحو ٢٠ طلبًا في اليوم لكل نموذج، وكل مهمة تستهلك طلبين أو ثلاثة). يتجدد الحد غدًا، أو اختر خدمة أخرى من «الخدمة».",
+                "You've reached this service's free limit for now (Gemini gives about 20 requests a day per model, and each task takes two or three). It renews tomorrow, or choose another service under Service.",
             )
             .to_string()
         } else if has("network") {
@@ -318,17 +375,52 @@ mod native {
         let title = app.session.documents().into_iter().find(|d| d.active).map(|d| d.title).unwrap_or_default();
         let selection = wordcraft_agent::error::clip(&app.session.selected_text(), 4000);
         let mut s = format!(
-            "You are وكيل (Wakeel), the AI agent inside كلمة (Kalima), an Arabic-first word processor. \
+            "You are وكيل (Wakeel), the AI writing agent inside كلمة (Kalima), an Arabic-first word processor. \
              The person is looking at their open document \"{title}\", and you change it live with your tools: \
-             every command you run happens in their window while they watch.\n\
-             - Read before you change: get_text for the words, inspect_document for structure, styles and the selection.\n\
-             - Find command ids and their params with list_commands (a query such as \"bold\", \"table\", \"heading\", \"align\", \"font\"), \
-             then run them with execute, or several in order with batch.\n\
-             - select_text selects text to format or replace; type_text types at the caret and replaces the selection. \
-             Use paragraphs: true to type several paragraphs at once.\n\
-             - Work in small steps the person can follow. Don't open, save, close or print files: the person does that.\n\
-             - Everything you do in one turn is a single Undo step for the person.\n\
-             - Reply in the person's language, briefly: say what you changed, not how. Use Markdown sparingly.\n"
+             every change happens in their window while they watch.\n\
+             \n\
+             Quality comes first. Write like a gifted professional author and editor: rich, vivid, well-organised \
+             prose with a clear beginning, middle and end, varied sentences and precise vocabulary. In Arabic, write \
+             eloquent Modern Standard Arabic with correct grammar, hamzas and punctuation (، ؛ ؟ « »), without full \
+             diacritics (tashkeel) unless asked. Never pad and never repeat yourself. A story has a title, \
+             characters, a setting and an arc over several developed paragraphs; an article or report has a title, \
+             an introduction, headed sections and a conclusion; a letter has a date, the addressee, a greeting, a \
+             clear request, a courteous closing and a signature block. Use [square brackets] only for personal \
+             details the person must fill in (their name, an ID, a date), never for content you can write. Don't \
+             sign as وكيل or invent an author.\n\
+             \n\
+             Writing new content (a story, article, report, letter, CV, plan, poem…): call write_document ONCE \
+             with the complete content as HTML. <h1> is the title, <h2>/<h3> are section headings, one <p> per \
+             paragraph, <ul>/<ol> for lists, <strong>/<em> for emphasis, <blockquote> for a quotation, <table> \
+             only for real tabular data (never for layout). Use mode \"replace\" only when the document is empty \
+             or you rewrite the whole of it (correcting, shortening or translating it, or the person asked to \
+             replace it); otherwise \"append\", so the person's text is never lost. Never type long text piece \
+             by piece, never write the same content twice, and never write Markdown (** or #): use HTML tags.\n\
+             \n\
+             Design tastefully with inline CSS in that HTML: centre the title (text-align:center) and give it and \
+             the section headings one calm accent colour (such as #1F3A5F, #0F5132 or #7A3E00); a short subtitle \
+             under the title may be centred and grey. Justify body paragraphs (text-align:justify) and keep their \
+             text black and their size normal. In a table, make the header row <th> cells bold with a light \
+             background (such as #E8EEF6). Don't set font-family (the document's Arabic font is used), and don't use \
+             <div> wrappers, margins, widths or borders. Restraint looks professional: no rainbow colours, no huge \
+             fonts.\n\
+             \n\
+             Changing an existing document: read it first (get_text; inspect_document shows styles and formatting).\n\
+             - Correcting, improving, shortening or translating it: keep its structure. Rewrite the paragraphs as \
+             they are; don't add a title, headings or sections it didn't have. If the whole document changes, call \
+             write_document with mode \"replace\" and the same structure (its title as <h1> only if it already had \
+             one). If only the selection or one passage changes, select_text it and type_text the new wording.\n\
+             - Adding to it (a table, a summary, a conclusion, a section): write_document with mode \"append\" adds \
+             after the text; never rewrite what is already there to add something.\n\
+             - Formatting part of it (bold a heading, colour, size, alignment, style): select_text the exact words, \
+             then execute commands on the selection, for example format.bold {{\"value\": true}}, format.growFont, \
+             format.size {{\"size\": 20}}, format.color {{\"color\": \"1F3A5F\"}}, para.alignCenter, styles.apply \
+             {{\"style\": \"Heading 1\"}}. In batch, every entry is an engine command id (select.text \
+             {{\"text\": \"…\"}}, format.bold…), not a tool name. list_commands finds other commands: don't guess ids.\n\
+             \n\
+             Don't open, save, close or print files: the person does that. Everything you do in one turn is a single \
+             Undo step for the person. When you're done, reply in the person's language in one or two short \
+             sentences: what you made or changed. Don't paste the content into the chat.\n"
         );
         if selection.trim().is_empty() {
             s.push_str("Nothing is selected now.");
@@ -369,7 +461,7 @@ mod native {
         let history = st.chat.clone();
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut tools = AppTools { tx: st.req_tx.clone(), ctx: ctx.clone() };
+        let mut tools = AppTools { tx: st.req_tx.clone(), ctx: ctx.clone(), read_doc: false };
         let (worker_cancel, worker_ctx) = (cancel.clone(), ctx.clone());
         let spawned = std::thread::Builder::new().name("agent".into()).spawn(move || {
             let mut allowed = std::collections::HashSet::new();
@@ -379,7 +471,8 @@ mod native {
             });
             let error = match r {
                 Ok(()) | Err(Error::Cancelled) => None,
-                Err(e) => Some(friendly(&e.to_string())),
+                // Worded in `drain`, on the window's thread, where the interface language is set.
+                Err(e) => Some(e.to_string()),
             };
             let _ = tx.send(Msg::Done(error));
             worker_ctx.request_repaint();
@@ -388,7 +481,17 @@ mod native {
             st.chat.pop();
             return Err(e.to_string());
         }
-        st.run = Some(Running { rx, cancel, text: String::new(), tool: None, mark, doc });
+        st.run = Some(Running {
+            rx,
+            cancel,
+            text: String::new(),
+            tool: None,
+            thinking: false,
+            retrying: None,
+            started: std::time::Instant::now(),
+            mark,
+            doc,
+        });
         Ok(())
     }
 
@@ -396,6 +499,8 @@ mod native {
     struct AppTools {
         tx: Sender<ControlRequest>,
         ctx: egui::Context,
+        /// The model read the document this turn: only then may it replace text that is there.
+        read_doc: bool,
     }
 
     impl wordcraft_mcp::Backend for AppTools {
@@ -415,6 +520,202 @@ mod native {
         }
         fn describe(&self) -> String {
             "the open window".into()
+        }
+    }
+
+    /// The agent's own tool for writing whole passages, formatted, in one step.
+    const WRITE_DOCUMENT: &str = "write_document";
+
+    /// The most HTML one write_document call takes.
+    const MAX_WRITE_HTML: usize = 2 << 20;
+
+    fn write_document_spec() -> ToolSpec {
+        ToolSpec {
+            name: WRITE_DOCUMENT.into(),
+            description: "Write formatted content into the document in one step: a story, article, letter, report, \
+                          plan or any passage longer than a sentence. Give complete, well-structured HTML: <h1> for the \
+                          title, <h2>/<h3> for section headings, <p> for each paragraph, <ul>/<ol> lists, <strong>, <em>, \
+                          <blockquote>, <table>. Inline CSS works for color, font-size, font-weight and text-align. \
+                          Arabic paragraphs are made right to left automatically. mode \"replace\" replaces the whole \
+                          document (use it for new content in an empty or draft document); \"append\" adds after the \
+                          existing text."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "html": {"type": "string", "description": "The content as HTML (body content only)"},
+                    "mode": {"type": "string", "enum": ["replace", "append"]}
+                },
+                "required": ["html"]
+            }),
+        }
+    }
+
+    /// `\n` and `\r\n` written out as characters (a model escaping twice) as real line breaks.
+    fn unescape_breaks(t: &str) -> String {
+        if t.contains("\\n") { t.replace("\\r\\n", "\n").replace("\\n", "\n") } else { t.to_string() }
+    }
+
+    /// Whether `t` uses Markdown marks a model may write instead of formatting: `**bold**`, or a
+    /// line starting with `#`.
+    fn looks_like_markdown(t: &str) -> bool {
+        t.contains("**") || t.lines().any(|l| l.trim_start().starts_with("# ") || l.trim_start().starts_with("## "))
+    }
+
+    /// `**bold**` as `<strong>`, and text with no HTML tags at all read as Markdown: `#` headings,
+    /// `-`/`*` list items and one paragraph per line, so no mark ends up in the document as text.
+    fn markdown_to_html(t: &str) -> String {
+        let has_tags = t.contains("</") || t.contains("<p") || t.contains("<h") || t.contains("<br");
+        let body = if has_tags {
+            t.to_string()
+        } else {
+            let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+            let mut out = String::new();
+            let mut in_list = false;
+            for line in t.lines().map(str::trim) {
+                let item = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "));
+                if in_list && item.is_none() {
+                    out.push_str("</ul>");
+                    in_list = false;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(i) = item {
+                    if !in_list {
+                        out.push_str("<ul>");
+                        in_list = true;
+                    }
+                    out.push_str(&format!("<li>{}</li>", esc(i)));
+                } else if let Some(h) = line.strip_prefix("### ") {
+                    out.push_str(&format!("<h3>{}</h3>", esc(h)));
+                } else if let Some(h) = line.strip_prefix("## ") {
+                    out.push_str(&format!("<h2>{}</h2>", esc(h)));
+                } else if let Some(h) = line.strip_prefix("# ") {
+                    out.push_str(&format!("<h1>{}</h1>", esc(h)));
+                } else {
+                    out.push_str(&format!("<p>{}</p>", esc(line)));
+                }
+            }
+            if in_list {
+                out.push_str("</ul>");
+            }
+            out
+        };
+        // `**x**` pairs as bold; an odd one left over is dropped.
+        let mut body = body;
+        if body.matches("**").count() % 2 == 1
+            && let Some(i) = body.rfind("**")
+        {
+            body.replace_range(i..i.saturating_add(2), "");
+        }
+        let mut out = String::with_capacity(body.len());
+        let mut open = false;
+        let mut rest = body.as_str();
+        while let Some(i) = rest.find("**") {
+            out.push_str(rest.get(..i).unwrap_or(""));
+            out.push_str(if open { "</strong>" } else { "<strong>" });
+            open = !open;
+            rest = rest.get(i.saturating_add(2)..).unwrap_or("");
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Whether `t` has Arabic-script letters.
+    fn has_arabic(t: &str) -> bool {
+        t.chars().any(|c| matches!(c as u32, 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF))
+    }
+
+    impl AppTools {
+        fn exec(&mut self, command: &str, params: Value) -> Result<Value, String> {
+            wordcraft_mcp::Backend::call(self, "engine.execute", json!({"command": command, "params": params}))
+        }
+
+        /// Paste `html` as formatted content (replacing the document, or after its text), then make
+        /// its paragraphs right to left when they are Arabic.
+        fn write_document(&mut self, input: &Value) -> Result<String, String> {
+            let html = input.get("html").and_then(Value::as_str).map(str::trim).unwrap_or("");
+            if html.is_empty() {
+                return Err("`html` is empty: send the content to write".into());
+            }
+            if html.len() > MAX_WRITE_HTML {
+                return Err(format!("`html` is too long (at most {MAX_WRITE_HTML} bytes); write it in parts with mode \"append\""));
+            }
+            let html = markdown_to_html(&unescape_breaks(html));
+            let existing = self.exec("document.text", json!({}))?;
+            let has_text = existing.get("text").and_then(Value::as_str).or(existing.as_str()).is_some_and(|t| !t.trim().is_empty());
+            // Replacing text the model never read would throw away the person's work (a light
+            // model asked for "a story" in a document with a list in it did): add after it instead.
+            let replace = match input.get("mode").and_then(Value::as_str) {
+                Some("replace") => !has_text || self.read_doc,
+                Some("append") => false,
+                _ => !has_text,
+            };
+            let start = if replace {
+                // Empty the body first: Select All with the caret in a table selects only that
+                // cell, and the new document would be written into it.
+                self.exec("document.setText", json!({"text": ""}))?;
+                self.exec("select.all", json!({}))?
+            } else {
+                self.exec("caret.docEnd", json!({}))?;
+                if has_text {
+                    self.exec("text.newParagraph", json!({}))?;
+                }
+                self.exec("caret.docEnd", json!({}))?
+            };
+            let start = start.get("anchor").cloned().unwrap_or(Value::Null);
+            let end = self.exec("edit.pasteSpecial", json!({"as": "html", "html": html}))?;
+            let end = end.get("focus").cloned().unwrap_or(Value::Null);
+            if has_arabic(&html) && !start.is_null() && !end.is_null() {
+                self.exec("select.range", json!({"anchor": start, "focus": end}))?;
+                self.exec("para.rtl", json!({"value": true}))?;
+                self.rtl_tables(&start, &end)?;
+                self.exec("select.range", json!({"anchor": end, "focus": end}))?;
+            }
+            Ok(if replace { "Wrote the document." } else { "Added the content after the existing text." }.into())
+        }
+    }
+
+    impl AppTools {
+        /// Make the tables written between `start` and `end` right to left, so their first column
+        /// stands at the right as in any Arabic table.
+        fn rtl_tables(&mut self, start: &Value, end: &Value) -> Result<(), String> {
+            let top = |p: &Value| p.get("path").and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_u64);
+            let (Some(from), Some(to)) = (top(start), top(end)) else { return Ok(()) };
+            let doc = self.exec("document.inspect", json!({}))?;
+            let tables: Vec<u64> = doc
+                .get("blocks")
+                .and_then(Value::as_array)
+                .map(|b| {
+                    b.iter()
+                        .filter(|b| b.get("type").and_then(Value::as_str) == Some("table"))
+                        .filter_map(|b| b.get("index").and_then(Value::as_u64))
+                        .filter(|i| (from..=to).contains(i))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for i in tables {
+                let mut at = start.clone();
+                if let Some(o) = at.as_object_mut() {
+                    o.insert("path".into(), json!([i, 0, 0, 0]));
+                    o.insert("off".into(), json!(0));
+                }
+                self.exec("select.range", json!({"anchor": at, "focus": at}))?;
+                self.exec("table.rtl", json!({"value": true}))?;
+            }
+            Ok(())
+        }
+    }
+
+    /// The command a tool name stands for, when a model sends a tool name as a command id.
+    fn command_for_tool(name: &str) -> Option<&'static str> {
+        match name {
+            "select_text" => Some("select.text"),
+            "type_text" => Some("text.insert"),
+            "get_text" => Some("document.text"),
+            "inspect_document" => Some("document.inspect"),
+            _ => None,
         }
     }
 
@@ -438,8 +739,13 @@ mod native {
                     if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
                         props.remove("doc");
                     }
-                    Some(ToolSpec { name: name.into(), description: d.get("description")?.as_str()?.into(), schema })
+                    let description = match name {
+                        "type_text" => "Type a few words at the caret (replacing the selection), for small edits. Each line of `text` becomes its own paragraph. For whole passages use write_document.".to_string(),
+                        _ => d.get("description")?.as_str()?.to_string(),
+                    };
+                    Some(ToolSpec { name: name.into(), description, schema })
                 })
+                .chain(std::iter::once(write_document_spec()))
                 .collect()
         }
 
@@ -452,15 +758,51 @@ mod native {
         }
 
         fn call(&mut self, name: &str, input: &Value) -> wordcraft_agent::Result<String> {
+            if input.get(INVALID_INPUT).is_some() {
+                return Err(Error::Tool("the arguments were not valid JSON; send an object".into()));
+            }
+            if matches!(name, "get_text" | "inspect_document") {
+                self.read_doc = true;
+            }
+            if name == WRITE_DOCUMENT {
+                return self.write_document(input).map_err(Error::Tool);
+            }
             if !TOOLS.contains(&name) {
                 return Err(Error::Tool(format!("unknown tool `{name}`")));
             }
-            if input.get(INVALID_INPUT).is_some() {
-                return Err(Error::Tool("the arguments were not valid JSON; send an object".into()));
+            // Markdown typed as text would show its ** and # marks: paste it formatted instead.
+            if name == "type_text"
+                && let Some(t) = input.get("text").and_then(Value::as_str)
+                && looks_like_markdown(&unescape_breaks(t))
+            {
+                let html = markdown_to_html(&unescape_breaks(t));
+                self.exec("edit.pasteSpecial", json!({"as": "html", "html": html})).map_err(Error::Tool)?;
+                return Ok("Typed the text, formatted.".into());
             }
             let mut input = input.clone();
             if let Some(o) = input.as_object_mut() {
                 o.remove("doc");
+                if name == "type_text"
+                    && let Some(t) = o.get("text").and_then(Value::as_str)
+                {
+                    let t = unescape_breaks(t);
+                    if t.contains('\n') {
+                        o.insert("paragraphs".into(), Value::Bool(true));
+                    }
+                    o.insert("text".into(), Value::String(t));
+                }
+            }
+            // Models often put the tool names in a batch: run the commands they stand for.
+            if name == "batch"
+                && let Some(list) = input.get_mut("commands").and_then(Value::as_array_mut)
+            {
+                for c in list.iter_mut() {
+                    if let Some(id) = c.get("command").and_then(Value::as_str).and_then(command_for_tool)
+                        && let Some(o) = c.as_object_mut()
+                    {
+                        o.insert("command".into(), Value::String(id.into()));
+                    }
+                }
             }
             let commands: Vec<&str> = match name {
                 "execute" => input.get("command").and_then(Value::as_str).into_iter().collect(),
@@ -495,6 +837,7 @@ mod native {
                 ids.join(l("، ", ", "))
             }
             "type_text" => l("كتابة نص", "Typing text").into(),
+            WRITE_DOCUMENT => l("كتابة المستند وتنسيقه", "Writing and formatting the document").into(),
             "select_text" => l("تحديد نص", "Selecting text").into(),
             "get_text" => l("قراءة المستند", "Reading the document").into(),
             "inspect_document" => l("فحص المستند", "Inspecting the document").into(),
@@ -695,10 +1038,21 @@ mod native {
         if let Some(run) = &st.run {
             ui.add_space(4.0);
             if run.text.is_empty() {
+                let secs = run.started.elapsed().as_secs();
+                let status = match &run.retrying {
+                    Some(m) => format!("{} ({m})", l("الخدمة مشغولة، أعيد المحاولة…", "The service is busy, trying again…")),
+                    None if run.thinking => l("يفكّر…", "Thinking…").to_string(),
+                    None => l("يعمل…", "Working…").to_string(),
+                };
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new(l("يعمل…", "Working…")).color(t.text_dim));
+                    ui.label(RichText::new(status).color(t.text_dim));
+                    if secs >= 3 {
+                        ui.label(RichText::new(format!("{secs} {}", l("ث", "s"))).small().color(t.text_dim));
+                    }
                 });
+                // Keep the seconds counting while nothing else changes.
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             } else {
                 crate::agent_markdown::show(ui, &run.text, t, copy);
             }
@@ -879,19 +1233,27 @@ mod native {
         #[test]
         fn the_agent_sees_only_its_tools_and_one_document() {
             let (tx, _rx) = channel();
-            let tools = AppTools { tx, ctx: egui::Context::default() };
+            let tools = AppTools { tx, ctx: egui::Context::default(), read_doc: false };
             let specs = tools.specs();
             let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-            assert_eq!(names.len(), TOOLS.len(), "{names:?}");
+            assert_eq!(names.len(), TOOLS.len() + 1, "{names:?}");
+            assert!(names.contains(&WRITE_DOCUMENT));
             for s in &specs {
                 assert!(s.schema.get("properties").and_then(|p| p.get("doc")).is_none(), "{} still offers `doc`", s.name);
             }
         }
 
         #[test]
+        fn escaped_line_breaks_become_real_ones() {
+            assert_eq!(unescape_breaks("a\\n\\nb"), "a\n\nb");
+            assert_eq!(unescape_breaks("a\nb"), "a\nb");
+            assert!(has_arabic("قصة") && !has_arabic("story"));
+        }
+
+        #[test]
         fn blocked_commands_never_reach_the_window() {
             let (tx, rx) = channel();
-            let mut tools = AppTools { tx, ctx: egui::Context::default() };
+            let mut tools = AppTools { tx, ctx: egui::Context::default(), read_doc: false };
             let e = tools.call("execute", &json!({"command": "file.save"}));
             assert!(e.is_err());
             let e = tools.call("batch", &json!({"commands": [{"command": "format.bold"}, {"command": "file.close"}]}));
@@ -902,9 +1264,23 @@ mod native {
         }
 
         #[test]
+        fn markdown_marks_become_formatting() {
+            assert_eq!(markdown_to_html("<p>هذا **مهم** جدًا</p>"), "<p>هذا <strong>مهم</strong> جدًا</p>");
+            assert_eq!(
+                markdown_to_html("# العنوان\nفقرة **أولى**\n- بند\n- آخر\nنهاية"),
+                "<h1>العنوان</h1><p>فقرة <strong>أولى</strong></p><ul><li>بند</li><li>آخر</li></ul><p>نهاية</p>"
+            );
+            assert_eq!(markdown_to_html("a ** b"), "<p>a  b</p>");
+            assert!(looks_like_markdown("## قسم\nنص"));
+            assert!(!looks_like_markdown("نص عادي"));
+        }
+
+        #[test]
         fn errors_read_plainly() {
             assert!(friendly("Gemini returned 401: bad").contains(l("المفتاح", "key")));
             assert!(friendly("OpenRouter returned 429: slow down").contains(l("حد", "limit")));
+            let busy = friendly("Gemini returned 503: This model is currently experiencing high demand");
+            assert!(busy.contains(l("مزدحمة", "busy")), "{busy}");
         }
     }
 }
