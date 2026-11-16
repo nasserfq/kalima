@@ -392,9 +392,10 @@ mod native {
              Writing new content (a story, article, report, letter, CV, plan, poem…): call write_document ONCE \
              with the complete content as HTML. <h1> is the title, <h2>/<h3> are section headings, one <p> per \
              paragraph, <ul>/<ol> for lists, <strong>/<em> for emphasis, <blockquote> for a quotation, <table> \
-             only for real tabular data (never for layout). Mode \"replace\" when the document is empty or the \
-             person asked for something new. Never type long text piece by piece, never write the same content \
-             twice.\n\
+             only for real tabular data (never for layout). Use mode \"replace\" only when the document is empty \
+             or you rewrite the whole of it (correcting, shortening or translating it, or the person asked to \
+             replace it); otherwise \"append\", so the person's text is never lost. Never type long text piece \
+             by piece, never write the same content twice, and never write Markdown (** or #): use HTML tags.\n\
              \n\
              Design tastefully with inline CSS in that HTML: centre the title (text-align:center) and give it and \
              the section headings one calm accent colour (such as #1F3A5F, #0F5132 or #7A3E00); a short subtitle \
@@ -460,7 +461,7 @@ mod native {
         let history = st.chat.clone();
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut tools = AppTools { tx: st.req_tx.clone(), ctx: ctx.clone() };
+        let mut tools = AppTools { tx: st.req_tx.clone(), ctx: ctx.clone(), read_doc: false };
         let (worker_cancel, worker_ctx) = (cancel.clone(), ctx.clone());
         let spawned = std::thread::Builder::new().name("agent".into()).spawn(move || {
             let mut allowed = std::collections::HashSet::new();
@@ -498,6 +499,8 @@ mod native {
     struct AppTools {
         tx: Sender<ControlRequest>,
         ctx: egui::Context,
+        /// The model read the document this turn: only then may it replace text that is there.
+        read_doc: bool,
     }
 
     impl wordcraft_mcp::Backend for AppTools {
@@ -553,6 +556,72 @@ mod native {
         if t.contains("\\n") { t.replace("\\r\\n", "\n").replace("\\n", "\n") } else { t.to_string() }
     }
 
+    /// Whether `t` uses Markdown marks a model may write instead of formatting: `**bold**`, or a
+    /// line starting with `#`.
+    fn looks_like_markdown(t: &str) -> bool {
+        t.contains("**") || t.lines().any(|l| l.trim_start().starts_with("# ") || l.trim_start().starts_with("## "))
+    }
+
+    /// `**bold**` as `<strong>`, and text with no HTML tags at all read as Markdown: `#` headings,
+    /// `-`/`*` list items and one paragraph per line, so no mark ends up in the document as text.
+    fn markdown_to_html(t: &str) -> String {
+        let has_tags = t.contains("</") || t.contains("<p") || t.contains("<h") || t.contains("<br");
+        let body = if has_tags {
+            t.to_string()
+        } else {
+            let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+            let mut out = String::new();
+            let mut in_list = false;
+            for line in t.lines().map(str::trim) {
+                let item = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "));
+                if in_list && item.is_none() {
+                    out.push_str("</ul>");
+                    in_list = false;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(i) = item {
+                    if !in_list {
+                        out.push_str("<ul>");
+                        in_list = true;
+                    }
+                    out.push_str(&format!("<li>{}</li>", esc(i)));
+                } else if let Some(h) = line.strip_prefix("### ") {
+                    out.push_str(&format!("<h3>{}</h3>", esc(h)));
+                } else if let Some(h) = line.strip_prefix("## ") {
+                    out.push_str(&format!("<h2>{}</h2>", esc(h)));
+                } else if let Some(h) = line.strip_prefix("# ") {
+                    out.push_str(&format!("<h1>{}</h1>", esc(h)));
+                } else {
+                    out.push_str(&format!("<p>{}</p>", esc(line)));
+                }
+            }
+            if in_list {
+                out.push_str("</ul>");
+            }
+            out
+        };
+        // `**x**` pairs as bold; an odd one left over is dropped.
+        let mut body = body;
+        if body.matches("**").count() % 2 == 1
+            && let Some(i) = body.rfind("**")
+        {
+            body.replace_range(i..i.saturating_add(2), "");
+        }
+        let mut out = String::with_capacity(body.len());
+        let mut open = false;
+        let mut rest = body.as_str();
+        while let Some(i) = rest.find("**") {
+            out.push_str(rest.get(..i).unwrap_or(""));
+            out.push_str(if open { "</strong>" } else { "<strong>" });
+            open = !open;
+            rest = rest.get(i.saturating_add(2)..).unwrap_or("");
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// Whether `t` has Arabic-script letters.
     fn has_arabic(t: &str) -> bool {
         t.chars().any(|c| matches!(c as u32, 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF))
@@ -573,15 +642,20 @@ mod native {
             if html.len() > MAX_WRITE_HTML {
                 return Err(format!("`html` is too long (at most {MAX_WRITE_HTML} bytes); write it in parts with mode \"append\""));
             }
-            let html = unescape_breaks(html);
+            let html = markdown_to_html(&unescape_breaks(html));
             let existing = self.exec("document.text", json!({}))?;
             let has_text = existing.get("text").and_then(Value::as_str).or(existing.as_str()).is_some_and(|t| !t.trim().is_empty());
+            // Replacing text the model never read would throw away the person's work (a light
+            // model asked for "a story" in a document with a list in it did): add after it instead.
             let replace = match input.get("mode").and_then(Value::as_str) {
-                Some("replace") => true,
+                Some("replace") => !has_text || self.read_doc,
                 Some("append") => false,
                 _ => !has_text,
             };
             let start = if replace {
+                // Empty the body first: Select All with the caret in a table selects only that
+                // cell, and the new document would be written into it.
+                self.exec("document.setText", json!({"text": ""}))?;
                 self.exec("select.all", json!({}))?
             } else {
                 self.exec("caret.docEnd", json!({}))?;
@@ -687,11 +761,23 @@ mod native {
             if input.get(INVALID_INPUT).is_some() {
                 return Err(Error::Tool("the arguments were not valid JSON; send an object".into()));
             }
+            if matches!(name, "get_text" | "inspect_document") {
+                self.read_doc = true;
+            }
             if name == WRITE_DOCUMENT {
                 return self.write_document(input).map_err(Error::Tool);
             }
             if !TOOLS.contains(&name) {
                 return Err(Error::Tool(format!("unknown tool `{name}`")));
+            }
+            // Markdown typed as text would show its ** and # marks: paste it formatted instead.
+            if name == "type_text"
+                && let Some(t) = input.get("text").and_then(Value::as_str)
+                && looks_like_markdown(&unescape_breaks(t))
+            {
+                let html = markdown_to_html(&unescape_breaks(t));
+                self.exec("edit.pasteSpecial", json!({"as": "html", "html": html})).map_err(Error::Tool)?;
+                return Ok("Typed the text, formatted.".into());
             }
             let mut input = input.clone();
             if let Some(o) = input.as_object_mut() {
@@ -1147,7 +1233,7 @@ mod native {
         #[test]
         fn the_agent_sees_only_its_tools_and_one_document() {
             let (tx, _rx) = channel();
-            let tools = AppTools { tx, ctx: egui::Context::default() };
+            let tools = AppTools { tx, ctx: egui::Context::default(), read_doc: false };
             let specs = tools.specs();
             let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
             assert_eq!(names.len(), TOOLS.len() + 1, "{names:?}");
@@ -1167,7 +1253,7 @@ mod native {
         #[test]
         fn blocked_commands_never_reach_the_window() {
             let (tx, rx) = channel();
-            let mut tools = AppTools { tx, ctx: egui::Context::default() };
+            let mut tools = AppTools { tx, ctx: egui::Context::default(), read_doc: false };
             let e = tools.call("execute", &json!({"command": "file.save"}));
             assert!(e.is_err());
             let e = tools.call("batch", &json!({"commands": [{"command": "format.bold"}, {"command": "file.close"}]}));
@@ -1175,6 +1261,18 @@ mod native {
             let e = tools.call("screenshot", &json!({}));
             assert!(e.is_err());
             assert!(rx.try_recv().is_err(), "nothing was sent to the window");
+        }
+
+        #[test]
+        fn markdown_marks_become_formatting() {
+            assert_eq!(markdown_to_html("<p>هذا **مهم** جدًا</p>"), "<p>هذا <strong>مهم</strong> جدًا</p>");
+            assert_eq!(
+                markdown_to_html("# العنوان\nفقرة **أولى**\n- بند\n- آخر\nنهاية"),
+                "<h1>العنوان</h1><p>فقرة <strong>أولى</strong></p><ul><li>بند</li><li>آخر</li></ul><p>نهاية</p>"
+            );
+            assert_eq!(markdown_to_html("a ** b"), "<p>a  b</p>");
+            assert!(looks_like_markdown("## قسم\nنص"));
+            assert!(!looks_like_markdown("نص عادي"));
         }
 
         #[test]
