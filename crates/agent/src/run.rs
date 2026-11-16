@@ -31,6 +31,11 @@ pub enum Approval {
 pub enum RunEvent {
     Text(String),
     Thinking(String),
+    /// The service was busy, so the request is being sent again (to `model`, which may be a
+    /// fallback for the one the person chose).
+    Retrying {
+        model: String,
+    },
     /// A finished assistant message (append it to the chat).
     Assistant(Message),
     ToolStarted {
@@ -98,6 +103,7 @@ pub fn run(
         let reply = send(&cfg.provider, &cfg.key, &req, cancel, &mut |e| match e {
             StreamEvent::Text(t) => emit(RunEvent::Text(t)),
             StreamEvent::Thinking(t) => emit(RunEvent::Thinking(t)),
+            StreamEvent::Retrying { model } => emit(RunEvent::Retrying { model }),
         })?;
         emit(RunEvent::Usage { usage: reply.usage, cost: cfg.price.map(|p| cost(p, reply.usage.input, reply.usage.output)) });
         let calls = reply.message.tool_calls();

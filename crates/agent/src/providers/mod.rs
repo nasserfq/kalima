@@ -90,11 +90,90 @@ pub struct Request<'a> {
     pub effort: &'a str,
 }
 
-/// Send `req` and stream the reply to `on_event`.
+/// Waits before sending again to a busy service, and how many times it is tried.
+const RETRY_WAITS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
+
+/// Whether `e` means the service is busy or briefly down (worth sending the same request again).
+/// Nothing has streamed yet when these come back, so sending again is safe.
+pub fn is_busy(e: &Error) -> bool {
+    matches!(e, Error::Api { status: 500 | 502 | 503 | 504 | 529, .. }) || matches!(e, Error::Api { status: 0, body, .. } if is_overload_text(body))
+}
+
+fn is_overload_text(body: &str) -> bool {
+    let b = body.to_lowercase();
+    b.contains("overloaded") || b.contains("high demand") || b.contains("unavailable")
+}
+
+/// Google's free models, best first: when one is busy, out of quota or gone, the next is tried.
+const GEMINI_FREE: [&str; 3] = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest"];
+
+/// Other models to try, in order, when `model` stays busy or is out of quota: the other free
+/// models of the same service. A paid or unknown model has none (the person chose it on purpose).
+pub fn fallback_models(p: &Provider, model: &str) -> Vec<&'static str> {
+    match p.kind {
+        Kind::Gemini if model.contains("flash") || model.contains("gemma") => GEMINI_FREE.iter().copied().filter(|m| *m != model).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Send `req` and stream the reply to `on_event`. A busy service is tried again after a short
+/// wait, then the next free model where there is one (each change is reported with
+/// [`StreamEvent::Retrying`]).
 pub fn send(p: &Provider, key: &str, req: &Request, cancel: &Arc<AtomicBool>, on_event: &mut dyn FnMut(StreamEvent)) -> Result<Reply> {
     if p.needs_key && key.trim().is_empty() {
         return Err(Error::NoKey(p.name.clone()));
     }
+    let models: Vec<&str> = std::iter::once(req.model).chain(fallback_models(p, req.model).iter().copied().filter(|m| *m != req.model)).collect();
+    let mut last = None;
+    for (i, model) in models.iter().enumerate() {
+        let r = Request { model, ..req.clone() };
+        // The chosen model gets its retries; a fallback gets one try.
+        let waits: &[Duration] = if i == 0 { &RETRY_WAITS } else { &[] };
+        let mut attempt = 0usize;
+        loop {
+            match send_once(p, key, &r, cancel, on_event) {
+                Err(e) if is_busy(&e) => {
+                    if i == 0 {
+                        last = Some(e);
+                    }
+                    let Some(wait) = waits.get(attempt) else { break };
+                    attempt = attempt.saturating_add(1);
+                    on_event(StreamEvent::Retrying { model: (*model).to_string() });
+                    sleep_unless_cancelled(*wait, cancel)?;
+                }
+                // A fallback this key or service doesn't offer (any more): try the next one, and
+                // report the chosen model's busy error if none answers.
+                Err(Error::Api { status: 400 | 403 | 404, .. }) if i > 0 => break,
+                // Out of quota for now: waiting seconds won't help, another free model may.
+                Err(e @ Error::Api { status: 429, .. }) if models.len() > 1 => {
+                    last.get_or_insert(e);
+                    break;
+                }
+                other => return other,
+            }
+        }
+        if let Some(next) = models.get(i.saturating_add(1)) {
+            on_event(StreamEvent::Retrying { model: (*next).to_string() });
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Invalid("no model".into())))
+}
+
+fn sleep_unless_cancelled(d: Duration, cancel: &Arc<AtomicBool>) -> Result<()> {
+    let step = Duration::from_millis(100);
+    let mut left = d;
+    while !left.is_zero() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        let s = left.min(step);
+        std::thread::sleep(s);
+        left = left.saturating_sub(s);
+    }
+    Ok(())
+}
+
+fn send_once(p: &Provider, key: &str, req: &Request, cancel: &Arc<AtomicBool>, on_event: &mut dyn FnMut(StreamEvent)) -> Result<Reply> {
     match p.kind {
         Kind::Anthropic => anthropic::send(p, key, req, cancel, on_event),
         Kind::Gemini => gemini::send(p, key, req, cancel, on_event),
@@ -136,7 +215,7 @@ pub fn cost(price: (f64, f64), input: u64, output: u64) -> f64 {
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
-        .timeout_recv_response(Some(Duration::from_secs(300)))
+        .timeout_recv_response(Some(Duration::from_secs(120)))
         .http_status_as_error(false)
         .user_agent(concat!("Kalima-Agent/", env!("CARGO_PKG_VERSION")))
         // The system's own certificate store, as the app's updater uses.
@@ -226,6 +305,64 @@ mod tests {
         assert_eq!(parse_tool_input("{\"a\":1}"), serde_json::json!({"a":1}));
         assert!(parse_tool_input("{\"a\":").get(crate::INVALID_INPUT).is_some());
         assert!(parse_tool_input("[1]").get(crate::INVALID_INPUT).is_some());
+    }
+
+    #[test]
+    fn busy_services_are_retried_and_others_are_not() {
+        let api = |status| Error::Api { service: "Gemini".into(), status, body: "x".into() };
+        assert!(is_busy(&api(503)));
+        assert!(is_busy(&api(500)));
+        assert!(!is_busy(&api(400)));
+        assert!(!is_busy(&api(429)), "a quota limit doesn't clear in seconds");
+        assert!(is_busy(&Error::Api { service: "Gemini".into(), status: 0, body: "The model is overloaded".into() }));
+        assert!(!is_busy(&Error::Network("no route".into())));
+    }
+
+    #[test]
+    fn a_busy_gemini_flash_falls_back_to_other_free_models() {
+        let g = builtin_providers().into_iter().find(|p| p.id == "gemini").unwrap();
+        assert_eq!(fallback_models(&g, "gemini-flash-latest"), ["gemini-2.5-flash", "gemini-flash-lite-latest"]);
+        assert_eq!(fallback_models(&g, "gemini-3.1-flash-lite"), GEMINI_FREE);
+        let c = builtin_providers().into_iter().find(|p| p.id == "anthropic").unwrap();
+        assert!(fallback_models(&c, "claude-x").is_empty());
+    }
+
+    /// A local server that answers 503 for `gemini-flash-latest` and a short reply for any other model.
+    #[test]
+    fn send_moves_to_the_fallback_model_when_the_chosen_one_stays_busy() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let mut s = stream.unwrap();
+                let mut buf = vec![0u8; 1 << 16];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let resp = if head.contains("gemini-flash-latest") {
+                    let b = r#"{"error":{"code":503,"message":"This model is currently experiencing high demand."}}"#;
+                    format!(
+                        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{b}",
+                        b.len()
+                    )
+                } else {
+                    let b = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+                    format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{b}", b.len())
+                };
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let mut p = builtin_providers().into_iter().find(|p| p.id == "gemini").unwrap();
+        p.base_url = format!("http://127.0.0.1:{port}/v1beta");
+        let msgs = vec![crate::types::Message::user_text("hi")];
+        let req = Request { model: "gemini-flash-latest", system: "", messages: &msgs, tools: &[], effort: "" };
+        let mut events = Vec::new();
+        let r = send(&p, "k", &req, &Arc::new(AtomicBool::new(false)), &mut |e| events.push(e)).unwrap();
+        assert_eq!(r.message.text(), "ok");
+        assert_eq!(r.message.model.as_deref(), Some("gemini-2.5-flash"));
+        let retries: Vec<_> =
+            events.iter().filter_map(|e| if let StreamEvent::Retrying { model } = e { Some(model.as_str()) } else { None }).collect();
+        assert_eq!(retries, ["gemini-flash-latest", "gemini-flash-latest", "gemini-2.5-flash"]);
     }
 
     #[test]

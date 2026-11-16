@@ -118,6 +118,10 @@ pub enum StreamEvent {
     Text(String),
     /// A short reasoning summary or progress note, shown dimmed.
     Thinking(String),
+    /// The service was busy; the request is being sent again, to `model`.
+    Retrying {
+        model: String,
+    },
 }
 
 /// Why the model stopped.

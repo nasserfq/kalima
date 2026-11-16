@@ -129,6 +129,12 @@ mod native {
         text: String,
         /// The tool running now: its call id.
         tool: Option<String>,
+        /// The model is thinking (its reasoning streams but isn't shown).
+        thinking: bool,
+        /// The service was busy and the request is being sent again, to this model.
+        retrying: Option<String>,
+        /// When the turn began, for the seconds shown while waiting.
+        started: std::time::Instant,
         /// Undo history position and document when the turn began.
         mark: u64,
         doc: u64,
@@ -266,9 +272,22 @@ mod native {
         if let Some(run) = st.run.as_mut() {
             while let Ok(msg) = run.rx.try_recv() {
                 match msg {
-                    Msg::Event(RunEvent::Text(t)) => run.text.push_str(&t),
+                    Msg::Event(RunEvent::Text(t)) => {
+                        run.thinking = false;
+                        run.retrying = None;
+                        run.text.push_str(&t);
+                    }
+                    Msg::Event(RunEvent::Thinking(_)) => {
+                        run.thinking = true;
+                        run.retrying = None;
+                    }
+                    Msg::Event(RunEvent::Retrying { model }) => {
+                        run.thinking = false;
+                        run.retrying = Some(model);
+                    }
                     Msg::Event(RunEvent::Assistant(m)) => {
                         run.text.clear();
+                        run.thinking = false;
                         st.chat.push(m);
                     }
                     Msg::Event(RunEvent::ToolResults(m)) => st.chat.push(m),
@@ -279,7 +298,7 @@ mod native {
                     Msg::Event(RunEvent::Approve { reply, .. }) => {
                         let _ = reply.send(wordcraft_agent::run::Approval::No);
                     }
-                    Msg::Event(RunEvent::Thinking(_) | RunEvent::Finished(_)) => {}
+                    Msg::Event(RunEvent::Finished(_)) => {}
                     Msg::Done(e) => done = Some(e),
                 }
             }
@@ -300,6 +319,18 @@ mod native {
         let has = |s: &str| e.contains(s);
         if has(" 401") || has(" 403") || has("API key not valid") || has("invalid x-api-key") {
             l("المفتاح غير صحيح. افتح «الخدمة» وأدخل مفتاحًا جديدًا.", "The key isn't valid. Open Service and enter a new key.").to_string()
+        } else if has("returned 5") || has("high demand") || has("overloaded") {
+            l(
+                "الخدمة مزدحمة الآن ولم تستجب بعد عدة محاولات. حاول بعد دقيقة، أو اختر نموذجًا آخر من القائمة.",
+                "The service is busy right now and didn't answer after several tries. Try again in a minute, or choose another model.",
+            )
+            .to_string()
+        } else if has("timed out") || has("timeout") {
+            l(
+                "تأخرت الخدمة في الرد. حاول مرة أخرى، أو اختر نموذجًا أسرع.",
+                "The service took too long to answer. Try again, or choose a faster model.",
+            )
+            .to_string()
         } else if has(" 429") {
             l(
                 "تجاوزت حد الاستخدام لهذا النموذج الآن. انتظر قليلًا أو اختر نموذجًا آخر.",
@@ -318,17 +349,35 @@ mod native {
         let title = app.session.documents().into_iter().find(|d| d.active).map(|d| d.title).unwrap_or_default();
         let selection = wordcraft_agent::error::clip(&app.session.selected_text(), 4000);
         let mut s = format!(
-            "You are وكيل (Wakeel), the AI agent inside كلمة (Kalima), an Arabic-first word processor. \
+            "You are وكيل (Wakeel), the AI writing agent inside كلمة (Kalima), an Arabic-first word processor. \
              The person is looking at their open document \"{title}\", and you change it live with your tools: \
-             every command you run happens in their window while they watch.\n\
-             - Read before you change: get_text for the words, inspect_document for structure, styles and the selection.\n\
-             - Find command ids and their params with list_commands (a query such as \"bold\", \"table\", \"heading\", \"align\", \"font\"), \
-             then run them with execute, or several in order with batch.\n\
-             - select_text selects text to format or replace; type_text types at the caret and replaces the selection. \
-             Use paragraphs: true to type several paragraphs at once.\n\
-             - Work in small steps the person can follow. Don't open, save, close or print files: the person does that.\n\
+             every change happens in their window while they watch.\n\
+             \n\
+             Quality comes first. Write like a gifted professional author and editor: rich, vivid, well-organised \
+             prose with a clear beginning, middle and end, varied sentences and precise vocabulary. In Arabic, write \
+             eloquent Modern Standard Arabic with correct grammar and punctuation (، ؛ ؟). Never pad, never repeat \
+             yourself, and never leave placeholders. A story has a title, characters, a setting and an arc over \
+             several developed paragraphs; an article or report has a title, an introduction, headed sections and \
+             a conclusion.\n\
+             \n\
+             How to work:\n\
+             - To write new content or rewrite the document (a story, article, letter, report, plan, poem…), call \
+             write_document ONCE with the complete content as HTML: <h1> title, <h2> section headings, one <p> per \
+             paragraph, lists, <strong>/<em> for emphasis, <blockquote> for a quotation. Use mode \"replace\" when \
+             the document is empty or the person asked for something new, \"append\" to add to what is there. \
+             Never type long text piece by piece, and never write the same content twice.\n\
+             - Design tastefully with inline CSS in that HTML: centre the title (text-align:center) and give it one \
+             calm accent colour (such as #1F3A5F, #0F5132 or #7A3E00) that the section headings share; keep body \
+             text black and its size normal. Restraint looks professional: no rainbow colours, no huge fonts.\n\
+             - For small edits: get_text to read, select_text to select words, type_text to replace them, and \
+             execute or batch to run commands (list_commands finds command ids and params; for example \
+             format.bold, format.italic, format.size {{\"size\": 14}}, format.color {{\"color\": \"1F3A5F\"}}, \
+             para.alignCenter, styles.apply {{\"style\": \"Heading 1\"}}, insert.table {{\"rows\": 3, \"cols\": 3}}). \
+             Don't guess command ids: look them up.\n\
+             - Don't open, save, close or print files: the person does that.\n\
              - Everything you do in one turn is a single Undo step for the person.\n\
-             - Reply in the person's language, briefly: say what you changed, not how. Use Markdown sparingly.\n"
+             - When you're done, reply in the person's language in one or two short sentences: what you made or \
+             changed. Don't paste the content into the chat.\n"
         );
         if selection.trim().is_empty() {
             s.push_str("Nothing is selected now.");
@@ -388,7 +437,17 @@ mod native {
             st.chat.pop();
             return Err(e.to_string());
         }
-        st.run = Some(Running { rx, cancel, text: String::new(), tool: None, mark, doc });
+        st.run = Some(Running {
+            rx,
+            cancel,
+            text: String::new(),
+            tool: None,
+            thinking: false,
+            retrying: None,
+            started: std::time::Instant::now(),
+            mark,
+            doc,
+        });
         Ok(())
     }
 
@@ -418,6 +477,88 @@ mod native {
         }
     }
 
+    /// The agent's own tool for writing whole passages, formatted, in one step.
+    const WRITE_DOCUMENT: &str = "write_document";
+
+    /// The most HTML one write_document call takes.
+    const MAX_WRITE_HTML: usize = 2 << 20;
+
+    fn write_document_spec() -> ToolSpec {
+        ToolSpec {
+            name: WRITE_DOCUMENT.into(),
+            description: "Write formatted content into the document in one step: a story, article, letter, report, \
+                          plan or any passage longer than a sentence. Give complete, well-structured HTML: <h1> for the \
+                          title, <h2>/<h3> for section headings, <p> for each paragraph, <ul>/<ol> lists, <strong>, <em>, \
+                          <blockquote>, <table>. Inline CSS works for color, font-size, font-weight and text-align. \
+                          Arabic paragraphs are made right to left automatically. mode \"replace\" replaces the whole \
+                          document (use it for new content in an empty or draft document); \"append\" adds after the \
+                          existing text."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "html": {"type": "string", "description": "The content as HTML (body content only)"},
+                    "mode": {"type": "string", "enum": ["replace", "append"]}
+                },
+                "required": ["html"]
+            }),
+        }
+    }
+
+    /// `\n` and `\r\n` written out as characters (a model escaping twice) as real line breaks.
+    fn unescape_breaks(t: &str) -> String {
+        if t.contains("\\n") { t.replace("\\r\\n", "\n").replace("\\n", "\n") } else { t.to_string() }
+    }
+
+    /// Whether `t` has Arabic-script letters.
+    fn has_arabic(t: &str) -> bool {
+        t.chars().any(|c| matches!(c as u32, 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF))
+    }
+
+    impl AppTools {
+        fn exec(&mut self, command: &str, params: Value) -> Result<Value, String> {
+            wordcraft_mcp::Backend::call(self, "engine.execute", json!({"command": command, "params": params}))
+        }
+
+        /// Paste `html` as formatted content (replacing the document, or after its text), then make
+        /// its paragraphs right to left when they are Arabic.
+        fn write_document(&mut self, input: &Value) -> Result<String, String> {
+            let html = input.get("html").and_then(Value::as_str).map(str::trim).unwrap_or("");
+            if html.is_empty() {
+                return Err("`html` is empty: send the content to write".into());
+            }
+            if html.len() > MAX_WRITE_HTML {
+                return Err(format!("`html` is too long (at most {MAX_WRITE_HTML} bytes); write it in parts with mode \"append\""));
+            }
+            let html = unescape_breaks(html);
+            let existing = self.exec("document.text", json!({}))?;
+            let has_text = existing.get("text").and_then(Value::as_str).or(existing.as_str()).is_some_and(|t| !t.trim().is_empty());
+            let replace = match input.get("mode").and_then(Value::as_str) {
+                Some("replace") => true,
+                Some("append") => false,
+                _ => !has_text,
+            };
+            let start = if replace {
+                self.exec("select.all", json!({}))?
+            } else {
+                self.exec("caret.docEnd", json!({}))?;
+                if has_text {
+                    self.exec("text.newParagraph", json!({}))?;
+                }
+                self.exec("caret.docEnd", json!({}))?
+            };
+            let start = start.get("anchor").cloned().unwrap_or(Value::Null);
+            let end = self.exec("edit.pasteSpecial", json!({"as": "html", "html": html}))?;
+            let end = end.get("focus").cloned().unwrap_or(Value::Null);
+            if has_arabic(&html) && !start.is_null() && !end.is_null() {
+                self.exec("select.range", json!({"anchor": start, "focus": end}))?;
+                self.exec("para.rtl", json!({"value": true}))?;
+                self.exec("select.range", json!({"anchor": end, "focus": end}))?;
+            }
+            Ok(if replace { "Wrote the document." } else { "Added the content after the existing text." }.into())
+        }
+    }
+
     /// Commands the agent may not run: files, the window and Help belong to the person.
     fn blocked(command: &str) -> bool {
         command.starts_with("file.") || command.starts_with("ui.") || command.starts_with("help.") || command == "view.switchWindows"
@@ -438,8 +579,13 @@ mod native {
                     if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
                         props.remove("doc");
                     }
-                    Some(ToolSpec { name: name.into(), description: d.get("description")?.as_str()?.into(), schema })
+                    let description = match name {
+                        "type_text" => "Type a few words at the caret (replacing the selection), for small edits. Each line of `text` becomes its own paragraph. For whole passages use write_document.".to_string(),
+                        _ => d.get("description")?.as_str()?.to_string(),
+                    };
+                    Some(ToolSpec { name: name.into(), description, schema })
                 })
+                .chain(std::iter::once(write_document_spec()))
                 .collect()
         }
 
@@ -452,15 +598,27 @@ mod native {
         }
 
         fn call(&mut self, name: &str, input: &Value) -> wordcraft_agent::Result<String> {
-            if !TOOLS.contains(&name) {
-                return Err(Error::Tool(format!("unknown tool `{name}`")));
-            }
             if input.get(INVALID_INPUT).is_some() {
                 return Err(Error::Tool("the arguments were not valid JSON; send an object".into()));
+            }
+            if name == WRITE_DOCUMENT {
+                return self.write_document(input).map_err(Error::Tool);
+            }
+            if !TOOLS.contains(&name) {
+                return Err(Error::Tool(format!("unknown tool `{name}`")));
             }
             let mut input = input.clone();
             if let Some(o) = input.as_object_mut() {
                 o.remove("doc");
+                if name == "type_text"
+                    && let Some(t) = o.get("text").and_then(Value::as_str)
+                {
+                    let t = unescape_breaks(t);
+                    if t.contains('\n') {
+                        o.insert("paragraphs".into(), Value::Bool(true));
+                    }
+                    o.insert("text".into(), Value::String(t));
+                }
             }
             let commands: Vec<&str> = match name {
                 "execute" => input.get("command").and_then(Value::as_str).into_iter().collect(),
@@ -495,6 +653,7 @@ mod native {
                 ids.join(l("، ", ", "))
             }
             "type_text" => l("كتابة نص", "Typing text").into(),
+            WRITE_DOCUMENT => l("كتابة المستند وتنسيقه", "Writing and formatting the document").into(),
             "select_text" => l("تحديد نص", "Selecting text").into(),
             "get_text" => l("قراءة المستند", "Reading the document").into(),
             "inspect_document" => l("فحص المستند", "Inspecting the document").into(),
@@ -695,10 +854,21 @@ mod native {
         if let Some(run) = &st.run {
             ui.add_space(4.0);
             if run.text.is_empty() {
+                let secs = run.started.elapsed().as_secs();
+                let status = match &run.retrying {
+                    Some(m) => format!("{} ({m})", l("الخدمة مشغولة، أعيد المحاولة…", "The service is busy, trying again…")),
+                    None if run.thinking => l("يفكّر…", "Thinking…").to_string(),
+                    None => l("يعمل…", "Working…").to_string(),
+                };
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new(l("يعمل…", "Working…")).color(t.text_dim));
+                    ui.label(RichText::new(status).color(t.text_dim));
+                    if secs >= 3 {
+                        ui.label(RichText::new(format!("{secs} {}", l("ث", "s"))).small().color(t.text_dim));
+                    }
                 });
+                // Keep the seconds counting while nothing else changes.
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             } else {
                 crate::agent_markdown::show(ui, &run.text, t, copy);
             }
@@ -882,10 +1052,18 @@ mod native {
             let tools = AppTools { tx, ctx: egui::Context::default() };
             let specs = tools.specs();
             let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-            assert_eq!(names.len(), TOOLS.len(), "{names:?}");
+            assert_eq!(names.len(), TOOLS.len() + 1, "{names:?}");
+            assert!(names.contains(&WRITE_DOCUMENT));
             for s in &specs {
                 assert!(s.schema.get("properties").and_then(|p| p.get("doc")).is_none(), "{} still offers `doc`", s.name);
             }
+        }
+
+        #[test]
+        fn escaped_line_breaks_become_real_ones() {
+            assert_eq!(unescape_breaks("a\\n\\nb"), "a\n\nb");
+            assert_eq!(unescape_breaks("a\nb"), "a\nb");
+            assert!(has_arabic("قصة") && !has_arabic("story"));
         }
 
         #[test]
@@ -905,6 +1083,8 @@ mod native {
         fn errors_read_plainly() {
             assert!(friendly("Gemini returned 401: bad").contains(l("المفتاح", "key")));
             assert!(friendly("OpenRouter returned 429: slow down").contains(l("حد", "limit")));
+            let busy = friendly("Gemini returned 503: This model is currently experiencing high demand");
+            assert!(busy.contains(l("مزدحمة", "busy")), "{busy}");
         }
     }
 }
