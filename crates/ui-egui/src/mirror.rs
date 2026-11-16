@@ -27,6 +27,8 @@ struct Window {
     last_keep: Option<Rect>,
     /// Windows registered this frame with [`overlay`].
     overlays: Vec<LayerId>,
+    /// Painter-only layers registered this frame with [`painted`].
+    painted: Vec<LayerId>,
     /// Where last frame's floating layers were drawn, topmost first, and whether each was
     /// mirrored (else moved with the document area), for input.
     last_layers: Vec<(Rect, bool)>,
@@ -54,6 +56,14 @@ pub fn keep(ctx: &egui::Context, rect: Rect) {
 /// menu or tooltip that touches it, never moved with the document area under it.
 pub fn overlay(ctx: &egui::Context, layer: LayerId) {
     with(ctx.viewport_id(), |w| w.overlays.push(layer));
+}
+
+/// A layer painted this frame in `ctx`'s window that is not an egui area (a bare
+/// `layer_painter`, such as the drawn I-beam): egui doesn't list it among its layers, so without
+/// this it would be drawn where it was laid out, not where the user sees it. Each shape goes with
+/// its clip rect: moved with the document area when that holds it, mirrored otherwise.
+pub fn painted(ctx: &egui::Context, layer: LayerId) {
+    with(ctx.viewport_id(), |w| w.painted.push(layer));
 }
 
 fn mirror_rect(s: f32, r: Rect) -> Rect {
@@ -116,26 +126,34 @@ pub fn output(ctx: &egui::Context) {
         let r = i.viewport_rect();
         r.min.x + r.max.x
     });
-    let (keep, overlays) = with(ctx.viewport_id(), |w| {
+    let (keep, overlays, painted) = with(ctx.viewport_id(), |w| {
         let keep = w.keep.take();
         w.last_keep = keep;
         w.last_layers.clear();
         if s > 0.0 {
             w.span = s;
         }
-        (keep, std::mem::take(&mut w.overlays))
+        (keep, std::mem::take(&mut w.overlays), std::mem::take(&mut w.painted))
     });
     if !active() || s <= 0.0 {
         return;
     }
+    mirror_frame(ctx, s, keep, &overlays, &painted);
+}
+
+/// Mirror this frame's painting in `ctx`'s window across `s` (`min.x + max.x`), keeping the
+/// document area `keep` as a block.
+fn mirror_frame(ctx: &egui::Context, s: f32, keep: Option<Rect>, overlays: &[LayerId], painted: &[LayerId]) {
     let mut ids: Vec<LayerId> = ctx.memory(|m| m.layer_ids().collect());
-    if !ids.contains(&LayerId::background()) {
-        ids.push(LayerId::background());
+    for &id in std::iter::once(&LayerId::background()).chain(painted) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
     }
     // Each floating layer (menu, tooltip, dialog) is drawn whole one way, never split by what
     // lies under it: mirrored, or moved with the document area when it opened from the page.
     let floating = shown_layers(ctx, &ids);
-    let modes = layer_modes(&floating, &overlays, keep);
+    let modes = layer_modes(&floating, overlays, keep);
     with(ctx.viewport_id(), |w| {
         w.last_layers = floating.iter().zip(&modes).rev().map(|(&(_, r), &whole)| (to_screen_as(r, s, keep, whole), whole)).collect();
     });
@@ -323,6 +341,41 @@ mod tests {
             l("context", Order::Foreground, [100.0, 600.0, 250.0, 750.0]),
         ];
         assert_eq!(layer_modes(&floating, &[dialog.0], keep), [true, true, true, true, false]);
+    }
+
+    /// The I-beam drawn over the page on Windows is a bare painter layer, which egui doesn't
+    /// list. With a pane beside the page (وكيل), the document area is moved, not mirrored: the
+    /// I-beam has to move with it to stay under the pointer. It used to stay where it was laid
+    /// out, a pane's width away, so the pointer looked stuck in the grey margin.
+    #[test]
+    fn the_drawn_i_beam_stays_under_the_pointer_beside_a_pane() {
+        let ctx = egui::Context::default();
+        let s = 1000.0;
+        // Laid out at 0..700 (a 300 pt pane on its right); drawn at 300..1000.
+        let keep = Rect::from_min_max(pos2(0.0, 50.0), pos2(700.0, 900.0));
+        let pointer = pos2(800.0, 400.0);
+        let laid_out = to_layout(pointer, s, Some(keep), &[]);
+        assert_eq!(laid_out, pos2(500.0, 400.0));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ctx = ui.ctx();
+            ctx.set_cursor_icon(egui::CursorIcon::Text);
+            assert!(crate::ibeam::replace(ctx, laid_out, wordcraft_doc::props::Rgb(255, 255, 255)));
+            let painted = with(ctx.viewport_id(), |w| std::mem::take(&mut w.painted));
+            mirror_frame(ctx, s, Some(keep), &[], &painted);
+        });
+        out.textures_delta.clear();
+        let stems: Vec<f32> = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                Shape::LineSegment { points: [a, b], .. } if a.x == b.x && (b.y - a.y - 16.0).abs() < 0.01 => Some(a.x),
+                _ => None,
+            })
+            .collect();
+        assert!(!stems.is_empty(), "the I-beam was drawn");
+        for x in stems {
+            assert!((x - pointer.x).abs() <= 1.0, "the I-beam's stem at {x}, the pointer at {}", pointer.x);
+        }
     }
 
     #[test]

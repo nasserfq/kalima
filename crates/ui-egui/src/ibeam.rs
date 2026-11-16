@@ -17,8 +17,14 @@ pub(crate) fn replace(ctx: &egui::Context, p: Pos2, bg: Rgb) -> bool {
         return false;
     }
     ctx.set_cursor_icon(CursorIcon::None);
-    // Above the page and whatever floats over it, as the system pointer would be.
-    let painter = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::unique("wordcraft_ibeam")));
+    // Above the page and whatever floats over it, as the system pointer would be. Clipped to just
+    // the I-beam, and registered with the right-to-left mirroring: egui doesn't list a bare
+    // painter layer, and over the page the I-beam has to move with the document area. Left alone,
+    // it stayed where the page is laid out, a side pane's width away from the hidden pointer (with
+    // وكيل open the pointer looked stuck in the grey margin and clicks missed it).
+    let layer = LayerId::new(Order::Tooltip, Id::unique("wordcraft_ibeam"));
+    crate::mirror::painted(ctx, layer);
+    let painter = ctx.layer_painter(layer).with_clip_rect(egui::Rect::from_center_size(p, egui::vec2(16.0, 24.0)));
     paint(&painter, p, crate::canvas::caret_contrast(bg));
     true
 }
