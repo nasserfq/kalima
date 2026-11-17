@@ -6,7 +6,14 @@ use std::path::Path;
 
 /// Whether this running program was installed by an app store.
 pub fn installed() -> bool {
-    std::env::current_exe().map(|exe| installed_at(&exe)).unwrap_or(false)
+    mac_sandboxed(std::env::var_os("APP_SANDBOX_CONTAINER_ID").is_some()) || std::env::current_exe().map(|exe| installed_at(&exe)).unwrap_or(false)
+}
+
+/// Whether macOS runs this program in the App Sandbox: macOS sets `APP_SANDBOX_CONTAINER_ID` for
+/// every sandboxed process. Only the Mac App Store build is sandboxed, and App Review runs it before
+/// it has a store receipt, so this catches the review copy too.
+fn mac_sandboxed(container_id_set: bool) -> bool {
+    cfg!(target_os = "macos") && container_id_set
 }
 
 /// Whether a program at `exe` sits where a store installs it: Windows keeps MSIX packages under a
@@ -38,6 +45,12 @@ mod tests {
         assert!(!installed_at(Path::new("C:/Users/n/Downloads/Kalima/Kalima.exe")));
         assert!(!installed_at(Path::new("/Applications/كلمة.app/Contents/MacOS/wordcraft")));
         assert!(!installed_at(Path::new("C:/MyWindowsAppsBackup/Kalima.exe")));
+    }
+
+    #[test]
+    fn a_sandboxed_mac_program_is_a_store_copy() {
+        assert_eq!(mac_sandboxed(true), cfg!(target_os = "macos"));
+        assert!(!mac_sandboxed(false));
     }
 
     #[test]

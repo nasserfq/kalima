@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Mac App Store entitlements (packaging/macos/package-mas.sh). The App Store requires the sandbox.
+     - files.user-selected.read-write: open and save the documents people pick in Open/Save panels,
+       drop on the window or open from Finder.
+     - network.client: the AI assistant panel and online help talk to the internet.
+     - print: File > Print.
+     The website build keeps packaging/macos/entitlements.plist (no sandbox). Add an exception here
+     only with a reason in this comment. -->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.app-sandbox</key>
+  <true/>
+  <key>com.apple.security.files.user-selected.read-write</key>
+  <true/>
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <key>com.apple.security.print</key>
+  <true/>
+</dict>
+</plist>

@@ -132,6 +132,15 @@ fn body(app: &mut WordApp, ui: &mut egui::Ui) {
     ));
     ui.add_space(6.0);
     let Some(server) = server() else {
+        if craft_update::store::installed() {
+            // The App Store copy is sandboxed: it can't change other apps' settings, so it ships
+            // without the MCP server (packaging/macos/package-mas.sh).
+            ui.label(l(
+                "ربط تطبيقات الذكاء الاصطناعي متاح في نسخة كلمة المنزّلة من mokteb.com، لأن نسخ المتاجر لا تستطيع تعديل إعدادات التطبيقات الأخرى.",
+                "Connecting AI apps is available in the Kalima download from mokteb.com: store copies can't change other apps' settings.",
+            ));
+            return;
+        }
         ui.colored_label(
             ui.visuals().error_fg_color,
             l(

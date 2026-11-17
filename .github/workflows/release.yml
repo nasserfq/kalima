@@ -68,6 +68,32 @@ jobs:
           rm -f out/*.zip
           # Claude desktop extension: double-click to connect Claude to the installed app.
           packaging/mcpb/make-mcpb.sh out "$KALIMA_VERSION"
+      # The Mac App Store package (packaging/macos/package-mas.sh): sandboxed, App Store bundle ID,
+      # uploaded to App Store Connect when the API key secrets exist. Skipped without its secrets, and
+      # never holds back the website downloads.
+      - name: Mac App Store certificates
+        id: mas_cert
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        env:
+          MAS_CERTIFICATE: ${{ secrets.MAS_CERTIFICATE }}
+          MAS_CERTIFICATE_PASSWORD: ${{ secrets.MAS_CERTIFICATE_PASSWORD }}
+          MAS_PROVISION_PROFILE_B64: ${{ secrets.MAS_PROVISION_PROFILE }}
+          ASC_KEY: ${{ secrets.ASC_KEY }}
+        run: packaging/macos/import-mas-cert.sh
+      - name: Mac App Store package
+        if: runner.os == 'macOS' && steps.mas_cert.outcome == 'success' && env.MAS_APP_IDENTITY != ''
+        continue-on-error: true
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: DIST="$PWD/mas" packaging/macos/package-mas.sh --skip-build
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS' && env.MAS_APP_IDENTITY != ''
+        continue-on-error: true
+        with:
+          name: mac-app-store
+          path: mas/*.pkg
       - name: Windows and Linux builds
         if: runner.os != 'macOS'
         shell: bash
