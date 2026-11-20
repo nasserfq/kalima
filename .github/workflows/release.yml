@@ -29,7 +29,7 @@ jobs:
       KALIMA_VERSION: 1.${{ github.run_number }}.0
       WORDCRAFT_VERSION: 1.${{ github.run_number }}.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Interface translations (with Arabic)
         shell: bash
         run: |
@@ -88,7 +88,7 @@ jobs:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: DIST="$PWD/mas" packaging/macos/package-mas.sh --skip-build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: runner.os == 'macOS' && env.MAS_APP_IDENTITY != ''
         continue-on-error: true
         with:
@@ -120,13 +120,13 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: packaging/windows/msix/make-msix.ps1 -Version $env:KALIMA_VERSION -Out store
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: runner.os == 'Windows'
         continue-on-error: true
         with:
           name: microsoft-store
           path: store/*.msix
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: out/*
@@ -137,14 +137,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: "{macos,windows-x64,linux-x64}"
           merge-multiple: true
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: v1.${{ github.run_number }}.0
           name: كلمة ${{ github.run_number }}
